@@ -16,12 +16,11 @@ AsyncWebServer server(80);
 AsyncWebSocket ws("/ws");
 Adafruit_ADS1115 ads;
 
-// Sensitive Filter for Brainwaves
-float Q = 0.01, R = 0.1, P = 1.0, K = 0, X = 0; 
+float Q = 0.00005, R = 0.08, P = 1.0, K = 0, X = 0; 
 float prev_v = 0, threshold = 100.0; 
 bool relayState = false;
 
-/* ---------- DASHBOARD UI (STABLE) ---------- */
+/* ---------- DASHBOARD UI (LAG-FREE JS) ---------- */
 const char index_html[] PROGMEM = R"rawliteral(
 <!DOCTYPE html><html><head>
 <meta name="viewport" content="width=device-width, initial-scale=1">
@@ -56,13 +55,17 @@ const char index_html[] PROGMEM = R"rawliteral(
 <script>
 let cvs=document.getElementById("c"), ctx=cvs.getContext("2d"), data=[], max=150, limit=100, graphMax=200;
 function updateLimit(v) { limit=v; document.getElementById('val').innerText=v; fetch('/setTh?v='+v); }
+
+// RENDER LOOP (Fix for Lag)
 function render() {
   ctx.clearRect(0,0,cvs.width,cvs.height);
-  let cMax = Math.max(...data, limit, 50);
-  graphMax = (graphMax * 0.95) + (cMax * 1.1 * 0.05);
+  let currentMax = Math.max(...data, limit, 50);
+  graphMax = (graphMax * 0.95) + (currentMax * 1.1 * 0.05);
+  
   let limitY = cvs.height - (limit / graphMax * cvs.height);
   ctx.beginPath(); ctx.strokeStyle="rgba(255, 0, 0, 0.7)"; ctx.setLineDash([5, 5]);
   ctx.moveTo(0, limitY); ctx.lineTo(cvs.width, limitY); ctx.stroke(); ctx.setLineDash([]);
+  
   ctx.beginPath(); ctx.strokeStyle="#007aff"; ctx.lineWidth=3;
   for(let i=0;i<data.length;i++){
     let x=(i/max)*cvs.width, y=cvs.height - (data[i]/graphMax * cvs.height);
@@ -71,33 +74,37 @@ function render() {
   ctx.stroke();
   requestAnimationFrame(render);
 }
+
 let ws=new WebSocket("ws://"+location.host+"/ws");
 ws.onmessage=(e)=>{ try{ let o=JSON.parse(e.data); data.push(o.p); if(data.length>max)data.shift(); }catch(err){} };
-cvs.width=cvs.clientWidth; cvs.height=cvs.clientHeight; render();
+cvs.width=cvs.clientWidth; cvs.height=cvs.clientHeight;
+render();
 </script></body></html>
 )rawliteral";
 
+/* ---------- LOGIC ---------- */
 void performAction() {
   if (activeDevice == phoneMAC) {
     HTTPClient http;
     http.begin("http://192.168.4.2:8080/trigger"); 
-    http.setTimeout(150); 
+    http.setTimeout(150); // Instant timeout
     http.GET(); http.end();
   } else {
     relayState = !relayState;
     uint8_t s = relayState ? 1 : 0;
+    // Priority Send
     esp_now_send(relayMAC, &s, 1);
+    Serial.println(">>> RELAY SENT <<<");
   }
 }
 
 void setup() {
   Serial.begin(115200);
-  ads.begin(); ads.setGain(GAIN_TWO); 
-  ads.setDataRate(RATE_ADS1115_128SPS); // More accurate for EEG
-
+  ads.begin(); ads.setGain(GAIN_TWO); ads.setDataRate(RATE_ADS1115_860SPS);
+  
   WiFi.mode(WIFI_AP_STA);
   WiFi.softAP(ssid, password);
-  WiFi.setSleep(false); 
+  WiFi.setSleep(false); // Lag fix
   
   esp_now_init();
   esp_now_peer_info_t peerInfo = {};
@@ -112,39 +119,35 @@ void setup() {
     if(r->hasParam("t")){
       String t = r->getParam("t")->value();
       activeDevice = (t == "phone") ? phoneMAC : relayMAC;
+      Serial.println("Switched Target");
     }
     r->send(200);
   });
+  
   server.addHandler(&ws);
   server.begin();
 }
 
 void loop() {
-  // --- 1. SENSOR DATA ---
   float rV = ads.computeVolts(ads.readADC_SingleEnded(0));
-  float rW = abs(rV - prev_v); // Change detection
-  prev_v = rV;
-  
-  // --- 2. KALMAN FILTER ---
+  float rW = rV - prev_v; prev_v = rV;
   P = P + Q; K = P / (P + R); X = X + K * (rW - X); P = (1 - K) * P;
 
-  float focusPower = X * 25000; // Increased Gain for visibility
+  float focusPower = abs(X * 8000); 
   static unsigned long lastTrigger = 0, lastWS = 0;
 
-  // --- 3. SERIAL MONITOR & PLOTTER FIX ---
-  // Ensure Label:Value format for Plotter
-  Serial.print("P:"); Serial.print(focusPower); Serial.print(","); 
-  Serial.print("L:"); Serial.println(threshold);
+  // 1. Plotter (Always Active)
+  Serial.print("Focus_Power:"); Serial.print(focusPower); Serial.print(",");
+  Serial.print("Limit:"); Serial.println(threshold);
 
-  // --- 4. TRIGGER LOGIC ---
+  // 2. Trigger (Instant)
   if (focusPower > threshold && (millis() - lastTrigger > 3000)) {
-    lastTrigger = millis();
     performAction();
-    Serial.println(">>> TRIGGERED <<<");
+    lastTrigger = millis();
   }
 
-  // --- 5. WEB SYNC ---
-  if(millis() - lastWS > 100){
+  // 3. WS Update (Balanced)
+  if(millis() - lastWS > 80){ 
     if(ws.count() > 0 && ws.availableForWriteAll()){
         ws.textAll("{\"p\":" + String(focusPower, 2) + "}");
     }
