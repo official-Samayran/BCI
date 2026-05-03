@@ -48,25 +48,20 @@ class MyServerCallbacks: public BLEServerCallbacks {
     }
 };
 
-/* ---------- BLE CALLBACKS ---------- */
 class MyCallbacks: public BLECharacteristicCallbacks {
     void onWrite(BLECharacteristic *pCharacteristic) {
-      // Use .c_str() for safer string conversion on ESP32
-      String value = pCharacteristic->getValue().c_str(); 
+      String value = pCharacteristic->getValue().c_str(); // Use .c_str() for safety
       
       if (value.length() > 0) {
         
-        // 1. Check if the Flutter App sent the 'R' command
+        // 👇 THIS IS THE MASTER RULE: Only trigger relay if the App explicitly tells us to!
         if (value.indexOf("R") != -1 || value == "R") {
           Serial.println(">>> BLE: 'R' Command Received! Triggering Relay from App.");
-          triggerRelay(); // Manually trigger the relay via ESP-NOW
+          triggerRelay();
         } 
-        // 2. Otherwise, treat it as a new Threshold value
         else {
           float newThreshold = value.toFloat();
-          
-          // Only update if it's a valid number above 0
-          if (newThreshold > 0) { 
+          if (newThreshold > 0) {
             threshold = newThreshold;
             Serial.print(">>> BLE: New Threshold set to: ");
             Serial.println(threshold);
@@ -75,7 +70,6 @@ class MyCallbacks: public BLECharacteristicCallbacks {
       }
     }
 };
-
 
 void setup() {
   Serial.begin(115200);
@@ -127,24 +121,18 @@ void loop() {
   X = X + K * (rW - X); P = (1 - K) * P;
   float focusPower = abs(X * 8000);
 
+  // 👇 The Hardcoded Trigger Logic was DELETED from here.
+  // Now, the Arduino will only trigger the relay when the Flutter App sends the "R" command.
+
   static unsigned long lastPrint = 0;
-  static unsigned long lastTrigger = 0;
-
-  // 2. Relay Trigger Logic (Exceeding Threshold)
-  // Check if power > threshold and enforce a 3-second cooldown
-  if (focusPower > threshold && (millis() - lastTrigger > 3000)) {
-    triggerRelay();
-    lastTrigger = millis();
-  }
-
-  // 3. Serial Debugging
+  // 2. Serial Debugging
   if (millis() - lastPrint > 200) {
     Serial.print("Power: "); Serial.print(focusPower);
     Serial.print(" | Threshold: "); Serial.println(threshold);
     lastPrint = millis();
   }
 
-  // 4. Bluetooth Data Stream
+  // 3. Bluetooth Data Stream
   if (deviceConnected) {
     pTxCharacteristic->setValue(String(focusPower, 2).c_str());
     pTxCharacteristic->notify();
